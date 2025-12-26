@@ -334,10 +334,44 @@ const Recipes: React.FC = () => {
         // Создание нового рецепта - отправляем через API на модерацию
         const authorId = parseInt(user!.id, 10);
 
+        // Получаем access token из localStorage
+        const accessToken = localStorage.getItem('access-token');
+        if (!accessToken) {
+          toast({
+            title: 'Ошибка',
+            description: 'Требуется авторизация. Пожалуйста, войдите в аккаунт.',
+            variant: 'destructive'
+          });
+          return;
+        }
+
+        // Получаем CSRF token
+        let csrfToken: string | null = null;
+        try {
+          const csrfResponse = await fetch('/api/auth/csrf-token');
+          if (csrfResponse.ok) {
+            const csrfData = await csrfResponse.json();
+            csrfToken = csrfData.csrfToken;
+          }
+        } catch (csrfError) {
+          console.error('❌ [Recipes] Failed to get CSRF token:', csrfError);
+        }
+
+        if (!csrfToken) {
+          toast({
+            title: 'Ошибка',
+            description: 'Не удалось получить CSRF токен. Обновите страницу и попробуйте снова.',
+            variant: 'destructive'
+          });
+          return;
+        }
+
         const response = await fetch('/api/recipes', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`,
+            'X-CSRF-Token': csrfToken
           },
           body: JSON.stringify({
             title: recipeData.title,
@@ -350,12 +384,22 @@ const Recipes: React.FC = () => {
             cuisine: recipeData.cuisine,
             tips: recipeData.tips,
             image: recipeData.image,
-            authorId: authorId
+            authorId: authorId,
+            csrfToken: csrfToken
           })
         });
 
         if (!response.ok) {
-          throw new Error('Failed to save recipe');
+          if (response.status === 401) {
+            toast({
+              title: 'Ошибка авторизации',
+              description: 'Ваша сессия истекла. Пожалуйста, войдите в аккаунт снова.',
+              variant: 'destructive'
+            });
+            return;
+          }
+          const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+          throw new Error(errorData.error || 'Failed to save recipe');
         }
 
         const result = await response.json();
@@ -369,10 +413,11 @@ const Recipes: React.FC = () => {
       setShowRecipeModal(false);
       setEditingRecipe(null);
       loadRecipes();
-    } catch (error) {
+    } catch (error: any) {
+      console.error('❌ [Recipes] Error saving recipe:', error);
       toast({
         title: 'Ошибка',
-        description: 'Не удалось сохранить рецепт',
+        description: error.message || 'Не удалось сохранить рецепт',
         variant: 'destructive'
       });
     }

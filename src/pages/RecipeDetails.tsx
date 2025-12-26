@@ -48,11 +48,86 @@ const RecipeDetails: React.FC = () => {
     if (!id) return;
     (async () => {
       setLoading(true);
-      const data = await RecipeService.getRecipe(id);
-      setRecipe(data);
-      const comms = await RecipeService.getComments(id);
-      setComments(comms);
-      setLoading(false);
+      try {
+        // Загружаем рецепт из API (database)
+        const response = await fetch(`/api/recipes/${id}`);
+        
+        if (!response.ok) {
+          if (response.status === 404) {
+            setRecipe(null);
+            setLoading(false);
+            return;
+          }
+          throw new Error('Failed to load recipe');
+        }
+
+        const dbRecipe = await response.json();
+        
+        // Преобразуем рецепт из БД в формат Recipe
+        const recipeData: Recipe = {
+          id: dbRecipe.id.toString(),
+          title: dbRecipe.title,
+          description: dbRecipe.description || '',
+          cookTime: dbRecipe.cook_time || '',
+          servings: dbRecipe.servings || 0,
+          difficulty: dbRecipe.difficulty || 'Medium',
+          cuisine: dbRecipe.cuisine || undefined,
+          ingredients: Array.isArray(dbRecipe.ingredients) 
+            ? dbRecipe.ingredients 
+            : JSON.parse(dbRecipe.ingredients || '[]'),
+          instructions: Array.isArray(dbRecipe.instructions) 
+            ? dbRecipe.instructions 
+            : JSON.parse(dbRecipe.instructions || '[]'),
+          tips: dbRecipe.tips || undefined,
+          image: dbRecipe.image || undefined,
+          author: {
+            id: dbRecipe.author?.id?.toString() || dbRecipe.author_id?.toString() || 'unknown',
+            name: dbRecipe.author?.name || (dbRecipe.author_email ? dbRecipe.author_email.split('@')[0] : 'User'),
+            email: dbRecipe.author?.email || dbRecipe.author_email || '',
+            avatar: dbRecipe.author?.avatar || '',
+            role: dbRecipe.author?.role || dbRecipe.author_role || 'user'
+          },
+          createdAt: dbRecipe.created_at || new Date().toISOString(),
+          updatedAt: dbRecipe.updated_at || new Date().toISOString(),
+          rating: dbRecipe.rating || 0,
+          likes: dbRecipe.likes || 0,
+          favorites: dbRecipe.favorites || 0,
+          commentsCount: dbRecipe.comments_count || 0,
+          status: dbRecipe.status || 'approved',
+          isLiked: false,
+          isFavorited: false
+        };
+
+        setRecipe(recipeData);
+
+        // Загружаем комментарии из API (database)
+        try {
+          const commentsResponse = await fetch(`/api/recipes/${id}/comments`);
+          if (commentsResponse.ok) {
+            const dbComments = await commentsResponse.json();
+            setComments(dbComments);
+          } else {
+            // Fallback к RecipeService если API не работает
+            const comms = await RecipeService.getComments(id);
+            setComments(comms);
+          }
+        } catch (commentsError) {
+          console.warn('⚠️ Failed to load comments from API, using fallback:', commentsError);
+          // Fallback к RecipeService
+          const comms = await RecipeService.getComments(id);
+          setComments(comms);
+        }
+      } catch (error) {
+        console.error('❌ Error loading recipe:', error);
+        toast({
+          title: 'Ошибка',
+          description: 'Не удалось загрузить рецепт',
+          variant: 'destructive'
+        });
+        setRecipe(null);
+      } finally {
+        setLoading(false);
+      }
     })();
   }, [id]);
 
@@ -205,17 +280,86 @@ ${recipe.tips ? `СОВЕТ: ${recipe.tips}` : ''}
     
     setIsSubmittingComment(true);
     try {
-      const comment = await RecipeService.addComment(recipe.id, newComment.trim(), user);
-      setComments(prev => [...prev, comment]);
+      // Получаем access token из localStorage
+      const accessToken = localStorage.getItem('access-token');
+      if (!accessToken) {
+        toast({
+          title: 'Ошибка',
+          description: 'Требуется авторизация. Пожалуйста, войдите в аккаунт.',
+          variant: 'destructive'
+        });
+        setIsSubmittingComment(false);
+        return;
+      }
+
+      // Получаем CSRF token
+      let csrfToken: string | null = null;
+      try {
+        const csrfResponse = await fetch('/api/auth/csrf-token');
+        if (csrfResponse.ok) {
+          const csrfData = await csrfResponse.json();
+          csrfToken = csrfData.csrfToken;
+        }
+      } catch (csrfError) {
+        console.error('❌ [RecipeDetails] Failed to get CSRF token:', csrfError);
+      }
+
+      if (!csrfToken) {
+        toast({
+          title: 'Ошибка',
+          description: 'Не удалось получить CSRF токен. Обновите страницу и попробуйте снова.',
+          variant: 'destructive'
+        });
+        setIsSubmittingComment(false);
+        return;
+      }
+
+      // Отправляем комментарий через API
+      const response = await fetch(`/api/recipes/${recipe.id}/comments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'X-CSRF-Token': csrfToken
+        },
+        body: JSON.stringify({
+          content: newComment.trim(),
+          csrfToken: csrfToken
+        })
+      });
+
+      if (!response.ok) {
+        if (response.status === 401) {
+          toast({
+            title: 'Ошибка авторизации',
+            description: 'Ваша сессия истекла. Пожалуйста, войдите в аккаунт снова.',
+            variant: 'destructive'
+          });
+          setIsSubmittingComment(false);
+          return;
+        }
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(errorData.error || 'Failed to add comment');
+      }
+
+      const comment = await response.json();
+      
+      // Обновляем список комментариев
+      setComments(prev => [comment, ...prev]);
+      
+      // Обновляем счетчик комментариев в рецепте
+      setRecipe(prev => prev ? { ...prev, commentsCount: (prev.commentsCount || 0) + 1 } : null);
+      
       setNewComment('');
       toast({
         title: "Комментарий добавлен!",
         description: "Ваш комментарий успешно опубликован",
       });
-    } catch (error) {
+    } catch (error: any) {
+      console.error('❌ [RecipeDetails] Error adding comment:', error);
       toast({
         title: "Ошибка",
-        description: "Не удалось добавить комментарий",
+        description: error.message || "Не удалось добавить комментарий",
         variant: "destructive",
       });
     } finally {

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -19,7 +20,8 @@ import {
   Trash2,
   Eye,
   Camera,
-  Globe
+  Globe,
+  Save
 } from "lucide-react";
 import { OpenAIService, Recipe } from "@/services/openai";
 import { CuisineSelector } from "@/components/ui/cuisine-selector";
@@ -40,6 +42,7 @@ interface SavedRecipe extends Recipe {
 }
 
 export const MyRecipes = () => {
+  const navigate = useNavigate();
   const [currentIngredient, setCurrentIngredient] = useState("");
   const [ingredients, setIngredients] = useState<string[]>([]);
   const [selectedCuisine, setSelectedCuisine] = useState<string>("");
@@ -72,10 +75,44 @@ export const MyRecipes = () => {
       // user.id is already a string from UserContext
       const authorId = parseInt(user.id, 10);
 
+      // Получаем access token из localStorage
+      const accessToken = localStorage.getItem('access-token');
+      if (!accessToken) {
+        toast({
+          title: 'Ошибка',
+          description: 'Требуется авторизация. Пожалуйста, войдите в аккаунт.',
+          variant: 'destructive'
+        });
+        return;
+      }
+
+      // Получаем CSRF token
+      let csrfToken: string | null = null;
+      try {
+        const csrfResponse = await fetch('/api/auth/csrf-token');
+        if (csrfResponse.ok) {
+          const csrfData = await csrfResponse.json();
+          csrfToken = csrfData.csrfToken;
+        }
+      } catch (csrfError) {
+        console.error('❌ [MyRecipes] Failed to get CSRF token:', csrfError);
+      }
+
+      if (!csrfToken) {
+        toast({
+          title: 'Ошибка',
+          description: 'Не удалось получить CSRF токен. Обновите страницу и попробуйте снова.',
+          variant: 'destructive'
+        });
+        return;
+      }
+
       const response = await fetch('/api/recipes', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'X-CSRF-Token': csrfToken
         },
         body: JSON.stringify({
           title: recipeToSave.title,
@@ -88,12 +125,22 @@ export const MyRecipes = () => {
           cuisine: recipeToSave.cuisine,
           tips: recipeToSave.tips,
           image: recipeToSave.image,
-          authorId: authorId
+          authorId: authorId,
+          csrfToken: csrfToken
         })
       });
 
       if (!response.ok) {
-        throw new Error('Failed to save recipe');
+        if (response.status === 401) {
+          toast({
+            title: 'Ошибка авторизации',
+            description: 'Ваша сессия истекла. Пожалуйста, войдите в аккаунт снова.',
+            variant: 'destructive'
+          });
+          return;
+        }
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(errorData.error || 'Failed to save recipe');
       }
 
       const result = await response.json();
@@ -624,8 +671,9 @@ export const MyRecipes = () => {
                             <Button
                               variant="ghost"
                               size="icon"
-                              onClick={() => setGeneratedRecipe(recipe)}
+                              onClick={() => navigate(`/recipes/${recipe.id}`)}
                               className="h-7 w-7 sm:h-8 sm:w-8 hover:bg-primary/10"
+                              title="Посмотреть рецепт"
                             >
                               <Eye className="w-3 h-3 sm:w-4 sm:h-4" />
                             </Button>
@@ -634,6 +682,7 @@ export const MyRecipes = () => {
                               size="icon"
                               onClick={() => handleDeleteRecipe(recipe.id)}
                               className="h-7 w-7 sm:h-8 sm:w-8 hover:bg-destructive/10 hover:text-destructive"
+                              title="Удалить рецепт"
                             >
                               <Trash2 className="w-3 h-3 sm:w-4 sm:h-4" />
                             </Button>

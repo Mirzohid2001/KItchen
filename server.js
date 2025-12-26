@@ -13,6 +13,7 @@ import FormData from 'form-data';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 
 // Загружаем переменные окружения
 dotenv.config();
@@ -823,6 +824,9 @@ const requestLogger = (req, res, next) => {
 const upload = multer({
   storage: multer.memoryStorage(), // Сохраняем в память для доступа к buffer
   limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit (reduced from default for security)
+  },
+  limits: {
     fileSize: 25 * 1024 * 1024, // 25MB максимум для аудио
   },
   fileFilter: (req, file, cb) => {
@@ -919,10 +923,29 @@ app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
 // Cookie parser middleware
 app.use(cookieParser());
 
+// Security headers with Helmet
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // React dev mode needs unsafe-eval
+      imgSrc: ["'self'", "data:", "https:", "http:"],
+      connectSrc: ["'self'", "https://api.openai.com", "https://cook.windexs.ru"],
+      fontSrc: ["'self'", "data:"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // Disable for compatibility
+  crossOriginResourcePolicy: { policy: "cross-origin" }, // Allow images from external sources
+}));
+
 // CORS middleware
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '10mb' })); // Reduced from 50mb for security
+app.use(express.urlencoded({ limit: '10mb', extended: true })); // Reduced from 50mb for security
 app.use(requestLogger);
 
 // Disable caching for all responses
@@ -1119,11 +1142,12 @@ app.post('/api/recipes', authenticateToken, csrfProtection, async (req, res) => 
       return res.status(503).json({ error: 'Database not initialized' });
     }
 
-    const { title, description, ingredients, instructions, cookTime, servings, difficulty, cuisine, tips, image, authorId } = req.body;
+    const { title, description, ingredients, instructions, cookTime, servings, difficulty, cuisine, tips, image, authorId, category } = req.body;
 
     console.log('📝 [Database] Received recipe save request:', {
       title: title?.substring(0, 30),
       authorId,
+      category,
       ingredientsType: Array.isArray(ingredients) ? 'array' : typeof ingredients,
       instructionsType: Array.isArray(instructions) ? 'array' : typeof instructions
     });
@@ -1132,6 +1156,16 @@ app.post('/api/recipes', authenticateToken, csrfProtection, async (req, res) => 
       console.warn('⚠️ [Database] Missing required fields:', { title: !!title, ingredients: !!ingredients, instructions: !!instructions });
       return res.status(400).json({ error: 'Missing required fields' });
     }
+
+    // Validate authorId - should come from authenticated user
+    const userId = req.user?.id;
+    if (!userId) {
+      console.error('❌ [Database] No user ID in request');
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    // Use authenticated user's ID instead of body authorId for security
+    const finalAuthorId = userId;
 
     const now = new Date().toISOString();
     const result = await withTransaction(async (db) => {
@@ -1150,7 +1184,7 @@ app.post('/api/recipes', authenticateToken, csrfProtection, async (req, res) => 
           category || '',
           tips || '',
           image || null,
-          authorId || null,
+          finalAuthorId,
           now,
           now,
           'pending' // Новые рецепты ждут модерации
@@ -1158,10 +1192,10 @@ app.post('/api/recipes', authenticateToken, csrfProtection, async (req, res) => 
       );
 
       // Log audit event
-      await auditLog(authorId, 'RECIPE_CREATE', 'recipe', insertResult.lastID, null, {
+      await auditLog(finalAuthorId, 'RECIPE_CREATE', 'recipe', insertResult.lastID, null, {
         title,
         status: 'pending',
-        category
+        category: category || ''
       }, req);
 
       return insertResult;
@@ -1171,7 +1205,12 @@ app.post('/api/recipes', authenticateToken, csrfProtection, async (req, res) => 
     res.json({ id: result.lastID, message: 'Recipe saved successfully' });
   } catch (error) {
     console.error('❌ [Database] Error saving recipe:', error.message, error.stack);
-    res.status(500).json({ error: 'Failed to save recipe', details: error.message });
+    // Don't expose stack trace in production
+    const isProduction = process.env.NODE_ENV === 'production';
+    res.status(500).json({ 
+      error: 'Failed to save recipe',
+      ...(isProduction ? {} : { details: error.message })
+    });
   }
 });
 
@@ -1183,10 +1222,18 @@ app.get('/api/recipes/:id', async (req, res) => {
     }
 
     const { id } = req.params;
-    const recipe = await db.get(
-      'SELECT * FROM recipes WHERE id = ?',
-      [id]
-    );
+    
+    // Получаем рецепт с информацией об авторе
+    const recipe = await db.get(`
+      SELECT 
+        r.*,
+        u.email as author_email,
+        u.role as author_role,
+        u.created_at as author_created_at
+      FROM recipes r
+      LEFT JOIN users u ON r.author_id = u.id
+      WHERE r.id = ?
+    `, [id]);
 
     if (!recipe) {
       return res.status(404).json({ error: 'Recipe not found' });
@@ -1195,6 +1242,15 @@ app.get('/api/recipes/:id', async (req, res) => {
     // Парсим JSON поля
     recipe.ingredients = JSON.parse(recipe.ingredients);
     recipe.instructions = JSON.parse(recipe.instructions);
+
+    // Добавляем информацию об авторе
+    recipe.author = {
+      id: recipe.author_id,
+      email: recipe.author_email || '',
+      name: recipe.author_email ? recipe.author_email.split('@')[0] : 'User',
+      role: recipe.author_role || 'user',
+      created_at: recipe.author_created_at
+    };
 
     res.json(recipe);
   } catch (error) {
@@ -1225,6 +1281,146 @@ app.delete('/api/recipes/:id', async (req, res) => {
   } catch (error) {
     console.error('❌ [Database] Error deleting recipe:', error);
     res.status(500).json({ error: 'Failed to delete recipe' });
+  }
+});
+
+// ===== COMMENTS ENDPOINTS =====
+
+// Получить комментарии для рецепта
+app.get('/api/recipes/:id/comments', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not initialized' });
+    }
+
+    const { id } = req.params;
+    
+    // Получаем комментарии с информацией об авторах
+    const comments = await db.all(`
+      SELECT 
+        c.*,
+        u.email as author_email,
+        u.role as author_role
+      FROM comments c
+      LEFT JOIN users u ON c.author_id = u.id
+      WHERE c.recipe_id = ? AND c.status = 'active'
+      ORDER BY c.created_at DESC
+    `, [id]);
+
+    // Преобразуем комментарии в нужный формат
+    const formattedComments = comments.map((comment) => ({
+      id: comment.id.toString(),
+      recipeId: comment.recipe_id.toString(),
+      author: {
+        id: comment.author_id.toString(),
+        name: comment.author_email ? comment.author_email.split('@')[0] : 'User',
+        email: comment.author_email || '',
+        avatar: '',
+        role: comment.author_role || 'user'
+      },
+      content: comment.content,
+      createdAt: comment.created_at,
+      likes: comment.likes || 0,
+      isLiked: false
+    }));
+
+    res.json(formattedComments);
+  } catch (error) {
+    console.error('❌ [Database] Error retrieving comments:', error);
+    res.status(500).json({ error: 'Failed to retrieve comments' });
+  }
+});
+
+// Добавить комментарий к рецепту
+app.post('/api/recipes/:id/comments', authenticateToken, csrfProtection, async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ error: 'Database not initialized' });
+    }
+
+    const { id } = req.params;
+    const { content, csrfToken } = req.body;
+
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: 'Comment content is required' });
+    }
+
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    // Проверяем, существует ли рецепт
+    const recipe = await db.get('SELECT id FROM recipes WHERE id = ?', [id]);
+    if (!recipe) {
+      return res.status(404).json({ error: 'Recipe not found' });
+    }
+
+    const now = new Date().toISOString();
+
+    const result = await withTransaction(async (db) => {
+      // Вставляем комментарий
+      const insertResult = await db.run(
+        `INSERT INTO comments (recipe_id, author_id, content, created_at, updated_at, status)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, userId, content.trim(), now, now, 'active']
+      );
+
+      // Увеличиваем счетчик комментариев в рецепте
+      await db.run(
+        'UPDATE recipes SET comments_count = comments_count + 1, updated_at = ? WHERE id = ?',
+        [now, id]
+      );
+
+      // Log audit event
+      await auditLog(userId, 'COMMENT_CREATE', 'comment', insertResult.lastID, null, {
+        recipe_id: id,
+        content: content.trim().substring(0, 50)
+      }, req);
+
+      return insertResult;
+    });
+
+    // Получаем созданный комментарий с информацией об авторе
+    const newComment = await db.get(`
+      SELECT 
+        c.*,
+        u.email as author_email,
+        u.role as author_role
+      FROM comments c
+      LEFT JOIN users u ON c.author_id = u.id
+      WHERE c.id = ?
+    `, [result.lastID]);
+
+    if (!newComment) {
+      return res.status(500).json({ error: 'Failed to retrieve created comment' });
+    }
+
+    const formattedComment = {
+      id: newComment.id.toString(),
+      recipeId: newComment.recipe_id.toString(),
+      author: {
+        id: newComment.author_id.toString(),
+        name: newComment.author_email ? newComment.author_email.split('@')[0] : 'User',
+        email: newComment.author_email || '',
+        avatar: '',
+        role: newComment.author_role || 'user'
+      },
+      content: newComment.content,
+      createdAt: newComment.created_at,
+      likes: newComment.likes || 0,
+      isLiked: false
+    };
+
+    console.log(`✅ [Database] Comment added with ID: ${result.lastID}`);
+    res.json(formattedComment);
+  } catch (error) {
+    console.error('❌ [Database] Error adding comment:', error.message, error.stack);
+    const isProduction = process.env.NODE_ENV === 'production';
+    res.status(500).json({ 
+      error: 'Failed to add comment',
+      ...(isProduction ? {} : { details: error.message })
+    });
   }
 });
 
@@ -1728,15 +1924,18 @@ app.post('/api/openai/tts', async (req, res) => {
         dataPreview: openaiDataPreview
       });
 
-      // Возвращаем детальную ошибку для клиента
+      // Возвращаем детальную ошибку для клиента (только в development)
+      const isProduction = process.env.NODE_ENV === 'production';
       res.status(error.response.status).json({
         error: 'TTS generation failed',
-        details: openaiError || openaiMessage || error.response.data,
-        openai_status: error.response.status,
-        openai_code: openaiCode,
-        openai_message: openaiMessage,
-        openai_data_preview: openaiDataPreview,
-        request_text: req.body.text ? req.body.text.substring(0, 100) : 'undefined'
+        ...(isProduction ? {} : {
+          details: openaiError || openaiMessage || error.response.data,
+          openai_status: error.response.status,
+          openai_code: openaiCode,
+          openai_message: openaiMessage,
+          openai_data_preview: openaiDataPreview,
+          request_text: req.body.text ? req.body.text.substring(0, 100) : 'undefined'
+        })
       });
     } else {
       console.error('❌ [TTS API] Network or other error:', {
@@ -1940,12 +2139,15 @@ app.post('/api/audio/speech', async (req, res) => {
         data: error.response.data
       });
 
-      // Возвращаем более детальную ошибку для отладки
+      // Возвращаем более детальную ошибку для отладки (только в development)
+      const isProduction = process.env.NODE_ENV === 'production';
       res.status(error.response.status).json({
         error: 'Speech synthesis failed',
-        details: error.response.data,
-        openai_status: error.response.status,
-        request_text: req.body.text?.substring(0, 100)
+        ...(isProduction ? {} : { 
+          details: error.response.data,
+          openai_status: error.response.status,
+          request_text: req.body.text?.substring(0, 100)
+        })
       });
     } else if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
       console.error('❌ [Speech API] Request timeout');
@@ -2214,10 +2416,13 @@ app.post('/api/audio/transcriptions', upload.single('file'), async (req, res) =>
                           JSON.stringify(error.response.data);
       console.log('❌ [Transcription API] OpenAI responded with error:', error.response.status, errorMessage);
       
+      const isProduction = process.env.NODE_ENV === 'production';
       res.status(error.response.status).json({
         error: 'Transcription failed',
-        details: errorMessage,
-        status: error.response.status
+        ...(isProduction ? {} : {
+          details: errorMessage,
+          status: error.response.status
+        })
       });
     } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
       // Таймаут
@@ -2341,9 +2546,10 @@ app.post('/api/openai/generate-image', async (req, res) => {
     });
 
     if (error.response) {
+      const isProduction = process.env.NODE_ENV === 'production';
       res.status(error.response.status).json({
         error: 'Image generation failed',
-        details: error.response.data
+        ...(isProduction ? {} : { details: error.response.data })
       });
     } else {
       res.status(500).json({
@@ -2524,9 +2730,10 @@ app.post('/api/openai/v1/audio/transcriptions', upload.fields([
       res.status(error.response.status).json(error.response.data);
     } else {
       console.error('❌ [OpenAI Audio] Network/other error:', error.message);
+      const isProduction = process.env.NODE_ENV === 'production';
       res.status(500).json({
         error: 'Audio transcription failed',
-        details: error.message
+        ...(isProduction ? {} : { details: error.message })
       });
     }
   }
@@ -2668,9 +2875,10 @@ app.use('/api/openai', async (req, res) => {
       stack: error.stack,
       url: `https://api.openai.com${req.path.replace('/api/openai', '')}`
     });
+    const isProduction = process.env.NODE_ENV === 'production';
     res.status(500).json({ 
       error: 'Internal server error',
-      details: error.message 
+      ...(isProduction ? {} : { details: error.message })
     });
   }
 });
@@ -4319,15 +4527,43 @@ app.post('/api/chat', async (req, res) => {
       error: error.message,
       stack: error.stack
     });
+    const isProduction = process.env.NODE_ENV === 'production';
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      ...(isProduction ? {} : { details: error.message })
     });
   }
 });
 
+// Global error handler middleware (must be after all routes)
+app.use((err, req, res, next) => {
+  console.error('❌ [Global Error Handler] Unhandled error:', {
+    message: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method
+  });
+
+  const isProduction = process.env.NODE_ENV === 'production';
+  
+  // Don't expose stack trace in production
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error',
+    ...(isProduction ? {} : { 
+      details: err.message,
+      path: req.path 
+    })
+  });
+});
+
 // Fallback для SPA - все остальные запросы возвращают index.html
+// НО только если это НЕ API запрос
 app.use((req, res) => {
+  // Если это API запрос, возвращаем 404
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({ error: 'API endpoint not found' });
+  }
+  
   // Отключаем кэширование для HTML файлов
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
